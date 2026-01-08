@@ -43,7 +43,8 @@ namespace Test
         private static readonly Dictionary<Client, VoiceBar> activeVoiceBars = new Dictionary<Client, VoiceBar>();
         private static readonly Dictionary<Client, GUIButton> clickButtons = new Dictionary<Client, GUIButton>(); // Invisible click buttons
         private static GUIFrame buttonContainer; // Container for buttons above all elements
-        private static readonly Dictionary<string, float> savedVolumes = new Dictionary<string, float>();
+        private static readonly Dictionary<string, float> savedVolumes = new Dictionary<string, float>(); // Key: AccountID or SessionId as string
+        private static readonly Dictionary<Client, float> lastKnownVolumes = new Dictionary<Client, float>(); // Track volume changes
         private static string settingsPath = string.Empty;
         private const float VoiceThreshold = 0.01f; // Minimum amplitude for displaying
         private const float FadeOutTime = 0.9f; // Fade out time after speaking ends
@@ -58,8 +59,14 @@ namespace Test
 
         public static void Initialize()
         {
-            // Path for saving settings: game save folder + mod subfolder
-            settingsPath = Path.Combine(SaveUtil.GetSaveFolder(SaveUtil.SaveType.Singleplayer), "VoiceChatMonitor", "volumes.xml");
+            // Path for saving settings: use the same path as shown in the user's XML file
+            string saveFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Daedalic Entertainment GmbH",
+                "Barotrauma"
+            );
+            settingsPath = Path.Combine(saveFolder, "VoiceChatMonitor", "volumes.xml");
+            DebugConsole.Log($"VoiceChatMonitor: Settings path = {settingsPath}");
             LoadVolumes();
             
             // Create container for buttons above all elements
@@ -88,13 +95,22 @@ namespace Test
                     savedVolumes.Clear();
                     foreach (var element in doc.Root?.Elements("player") ?? Enumerable.Empty<XElement>())
                     {
+                        // Try AccountID first, then SessionId, then name (for backward compatibility)
+                        string accountId = element.GetAttributeString("accountid", "");
+                        string sessionId = element.GetAttributeString("sessionid", "");
                         string name = element.GetAttributeString("name", "");
                         float volume = element.GetAttributeFloat("volume", 1.0f);
-                        if (!string.IsNullOrEmpty(name))
+                        
+                        string key = !string.IsNullOrEmpty(accountId) ? accountId 
+                                   : !string.IsNullOrEmpty(sessionId) ? sessionId 
+                                   : name;
+                        
+                        if (!string.IsNullOrEmpty(key))
                         {
-                            savedVolumes[name] = volume;
+                            savedVolumes[key] = volume;
                         }
                     }
+                    DebugConsole.Log($"Loaded {savedVolumes.Count} voice volume settings");
                 }
             }
             catch (Exception ex)
@@ -107,30 +123,70 @@ namespace Test
         {
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
+                string? directory = Path.GetDirectoryName(settingsPath);
+                if (directory != null)
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                
                 XDocument doc = new XDocument(new XElement("volumes"));
                 foreach (var kvp in savedVolumes)
                 {
-                    doc.Root!.Add(new XElement("player",
-                        new XAttribute("name", kvp.Key),
-                        new XAttribute("volume", kvp.Value)));
+                    var playerElement = new XElement("player",
+                        new XAttribute("volume", kvp.Value));
+                    
+                    // Try to find client to get AccountID and name
+                    Client? client = GameMain.Client?.ConnectedClients?.FirstOrDefault(c => GetClientKey(c) == kvp.Key);
+                    if (client != null)
+                    {
+                        if (client.AccountId.TryUnwrap(out var accountId))
+                        {
+                            // Use StringRepresentation for AccountID
+                            playerElement.SetAttributeValue("accountid", accountId.StringRepresentation);
+                        }
+                        playerElement.SetAttributeValue("sessionid", client.SessionId.ToString());
+                        playerElement.SetAttributeValue("name", client.Name ?? "");
+                    }
+                    else
+                    {
+                        // Fallback: use key as name for backward compatibility
+                        playerElement.SetAttributeValue("name", kvp.Key);
+                    }
+                    
+                    doc.Root!.Add(playerElement);
                 }
                 doc.Save(settingsPath);
+                DebugConsole.Log($"Saved {savedVolumes.Count} voice volume settings to {settingsPath}");
             }
             catch (Exception ex)
             {
-                DebugConsole.Log($"Failed to save voice volumes: {ex.Message}");
+                DebugConsole.Log($"Failed to save voice volumes: {ex.Message}\nStackTrace: {ex.StackTrace}");
             }
         }
-
-        public static float GetSavedVolume(string playerName)
-        {
-            return savedVolumes.TryGetValue(playerName, out float volume) ? volume : 1.0f;
+        
+        private static string GetClientKey(Client client)  
+        {  
+            // Prefer AccountID, then SessionId, then name  
+            if (client.AccountId.TryUnwrap(out var accountId))  
+            {  
+                return accountId.StringRepresentation;  
+            }  
+            return client.SessionId.ToString();  
         }
 
-        public static void SaveVolume(string playerName, float volume)
+        public static float GetSavedVolume(Client client)
         {
-            savedVolumes[playerName] = volume;
+            if (client == null) return 1.0f;
+            string key = GetClientKey(client);
+            return savedVolumes.TryGetValue(key, out float volume) ? volume : 1.0f;
+        }
+
+        public static void SaveVolume(Client client, float volume)
+        {
+            if (client == null) return;
+            string key = GetClientKey(client);
+            savedVolumes[key] = volume;
+            DebugConsole.Log($"Saving volume for {client.Name} (key: {key}): {volume}");
             SaveVolumes();
         }
 
@@ -152,6 +208,37 @@ namespace Test
             if (GameMain.Client?.ConnectedClients == null)
             {
                 return;
+            }
+
+            // Track volume changes for all connected clients
+            foreach (var client in GameMain.Client.ConnectedClients)
+            {
+                if (client == null) continue;
+                
+                // Check if volume changed (e.g., through vanilla menu)
+                if (lastKnownVolumes.TryGetValue(client, out float lastVolume))
+                {
+                    if (Math.Abs(client.VoiceVolume - lastVolume) > 0.001f)
+                    {
+                        // Volume changed - save it
+                        SaveVolume(client, client.VoiceVolume);
+                        DebugConsole.Log($"Volume changed for {client.Name}: {lastVolume} -> {client.VoiceVolume}");
+                    }
+                }
+                else
+                {
+                    // First time seeing this client - load saved volume
+                    float savedVolume = GetSavedVolume(client);
+                    if (Math.Abs(savedVolume - 1.0f) > 0.001f)
+                    {
+                        client.VoiceVolume = savedVolume;
+                        DebugConsole.Log($"Loaded saved volume for {client.Name}: {savedVolume}");
+                    }
+                    // Don't save here - only save when volume actually changes
+                }
+                
+                // Update last known volume
+                lastKnownVolumes[client] = client.VoiceVolume;
             }
 
             // Update existing bars and remove inactive ones
@@ -233,11 +320,15 @@ namespace Test
                 // Update the position right after creation
                 UpdateClickButtonPosition(client);
 
-                // Apply saved volume
-                if (savedVolumes.TryGetValue(client.Name, out float savedVolume))
+                // Apply saved volume (already loaded in Update method, but ensure it's set)
+                float savedVolume = GetSavedVolume(client);
+                if (Math.Abs(savedVolume - 1.0f) > 0.001f)
                 {
                     client.VoiceVolume = savedVolume;
                 }
+                
+                // Initialize last known volume
+                lastKnownVolumes[client] = client.VoiceVolume;
             }
             catch (Exception ex)
             {
@@ -349,6 +440,12 @@ namespace Test
                 GUI.RemoveFromUpdateList(button, true);
                 button.RectTransform.Parent = null;
                 clickButtons.Remove(client);
+            }
+            
+            // Clean up last known volume tracking when client disconnects
+            if (client != null && !GameMain.Client?.ConnectedClients?.Contains(client) == true)
+            {
+                lastKnownVolumes.Remove(client);
             }
         }
 
@@ -497,7 +594,7 @@ namespace Test
                     percentageText.Text = ToolBox.GetFormattedPercentage(newVolume);
                     
                     // Save to your mod XML config
-                    SaveVolume(client.Name, newVolume);
+                    SaveVolume(client, newVolume);
                     return true;
                 }
             };

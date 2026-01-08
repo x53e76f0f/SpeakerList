@@ -1,3 +1,2 @@
-<?xml version="1.0" encoding="utf-8"?>  
-<contentpackage name="SpeakerList" corepackage="false" gameversion="1.0.0.0">  
-</contentpackage>
+﻿<?xml version="1.0" encoding="utf-8"?>
+<contentpackage name="SpeakerList" modversion="1.0.0" corepackage="False" steamworkshopid="3642060355" gameversion="1.11.5.0" />
