@@ -38,16 +38,35 @@ namespace Test
     }
 
 #if CLIENT
+    internal enum VoiceBarDisplayMode
+    {
+        Current,
+        Enhanced
+    }
+
     internal static class VoiceChatUI
     {
         private static readonly Dictionary<Client, VoiceBar> activeVoiceBars = new Dictionary<Client, VoiceBar>();
         private static readonly Dictionary<Client, GUIButton> clickButtons = new Dictionary<Client, GUIButton>(); // Invisible click buttons
         private static GUIFrame buttonContainer; // Container for buttons above all elements
+        private static GUIButton settingsButton;
+        private static GUIFrame settingsMenuRoot;
+        private static GUITextBox settingsPathTextBox;
+        private static GUIDropDown settingsDisplayModeDropdown;
         private static readonly Dictionary<string, float> savedVolumes = new Dictionary<string, float>(); // Key: AccountID or SessionId as string
         private static readonly Dictionary<Client, float> lastKnownVolumes = new Dictionary<Client, float>(); // Track volume changes
+        private static VoiceBarDisplayMode displayMode = VoiceBarDisplayMode.Current;
         private static string settingsPath = string.Empty;
+        private static string legacySettingsPath = string.Empty;
+        private static bool loadedFromLegacyPath;
+        private static Vector2 hudAnchorNormalized = new Vector2(-1f, -1f);
+        private static bool isHudDragPendingStart;
+        private static bool isHudDragging;
+        private static Point hudDragStartMouse;
+        private static Point hudDragStartOrigin;
         private const float VoiceThreshold = 0.01f; // Minimum amplitude for displaying
-        private const float FadeOutTime = 0.9f; // Fade out time after speaking ends
+        private const float CurrentFadeOutTime = 0.9f; // Fade out time for the old mode
+        private const float EnhancedFadeOutTime = 2.1f; // Fade out time for the enhanced mode
         
         // Drawing parameters (same as for the boss bars on the right)
         public const float BarWidth = 150f;   // Bar width
@@ -56,16 +75,27 @@ namespace Test
         public const float TextHeight = 15f;  // Text height
         public const float RightMargin = 10f; // Margin from the right
         public const float TopMargin = 100f;  // Margin from the top (to not overlap other UI elements)
+        private const int SettingsButtonSize = 16;
+        private const int SettingsButtonOffsetX = -3; // Tune this to move the side settings icon horizontally.
+        private static readonly Color SettingsWindowBg = new Color(15, 15, 15, 242);
+        private static readonly Color SettingsHeaderBg = new Color(7, 7, 7, 255);
+        private static readonly Color SettingsBorder = new Color(88, 88, 88, 255);
+        private static readonly Color SettingsSectionBg = new Color(20, 20, 20, 238);
+        private static readonly Color SettingsSectionBorder = new Color(62, 62, 62, 255);
+        private static readonly Color SettingsTextMain = new Color(224, 224, 224, 255);
+        private static readonly Color SettingsTextDim = new Color(148, 148, 148, 255);
+
+        public static VoiceBarDisplayMode CurrentDisplayMode => displayMode;
+
+        public static float GetCurrentFadeOutTime()
+        {
+            return displayMode == VoiceBarDisplayMode.Enhanced ? EnhancedFadeOutTime : CurrentFadeOutTime;
+        }
 
         public static void Initialize()
         {
-            // Path for saving settings: use the same path as shown in the user's XML file
-            string saveFolder = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Daedalic Entertainment GmbH",
-                "Barotrauma"
-            );
-            settingsPath = Path.Combine(saveFolder, "VoiceChatMonitor", "volumes.xml");
+            settingsPath = GetPrimarySettingsPath();
+            legacySettingsPath = GetLegacySettingsPath();
             DebugConsole.Log($"VoiceChatMonitor: Settings path = {settingsPath}");
             LoadVolumes();
             
@@ -79,20 +109,166 @@ namespace Test
             }
         }
 
+        private static string GetPrimarySettingsPath()
+        {
+            string? configDirectory = Path.GetDirectoryName(Path.GetFullPath(GameSettings.PlayerConfigPath));
+            if (string.IsNullOrWhiteSpace(configDirectory))
+            {
+                configDirectory = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Daedalic Entertainment GmbH",
+                    "Barotrauma");
+            }
+            return Path.Combine(configDirectory, "VoiceChatMonitor", "volumes.xml");
+        }
+
+        private static string GetLegacySettingsPath()
+        {
+            string localAppDataFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Daedalic Entertainment GmbH",
+                "Barotrauma");
+            return Path.Combine(localAppDataFolder, "VoiceChatMonitor", "volumes.xml");
+        }
+
+        private static string ToDisplayModeValue(VoiceBarDisplayMode mode)
+        {
+            return mode == VoiceBarDisplayMode.Enhanced ? "enhanced" : "current";
+        }
+
+        private static VoiceBarDisplayMode ParseDisplayMode(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) { return VoiceBarDisplayMode.Current; }
+            string normalized = value.Trim().ToLowerInvariant();
+            if (normalized is "enhanced" or "advanced" or "расширенный")
+            {
+                return VoiceBarDisplayMode.Enhanced;
+            }
+            return VoiceBarDisplayMode.Current;
+        }
+
         public static void Dispose()
         {
             SaveVolumes();
             ClearAllBars();
         }
 
+        private static bool IsNormalizedCoordValid(float value) => value >= 0f && value <= 1f;
+
+        private static Point GetDefaultHudOriginPx()
+        {
+            float screenWidth = GameMain.GraphicsWidth;
+            int x = (int)(screenWidth - BarWidth - RightMargin);
+            int y = (int)TopMargin;
+            return ClampHudOriginToScreen(new Point(x, y));
+        }
+
+        private static Point ClampHudOriginToScreen(Point origin)
+        {
+            int screenWidth = Math.Max(1, GameMain.GraphicsWidth);
+            int screenHeight = Math.Max(1, GameMain.GraphicsHeight);
+            int maxX = Math.Max(0, screenWidth - (int)BarWidth - SettingsButtonSize - 8);
+            int maxY = Math.Max(0, screenHeight - (int)(BarHeight + TextHeight + 8));
+            int clampedX = Math.Clamp(origin.X, 0, maxX);
+            int clampedY = Math.Clamp(origin.Y, 0, maxY);
+            return new Point(clampedX, clampedY);
+        }
+
+        private static Point GetHudOriginPx()
+        {
+            if (!IsNormalizedCoordValid(hudAnchorNormalized.X) || !IsNormalizedCoordValid(hudAnchorNormalized.Y))
+            {
+                return GetDefaultHudOriginPx();
+            }
+
+            int screenWidth = Math.Max(1, GameMain.GraphicsWidth);
+            int screenHeight = Math.Max(1, GameMain.GraphicsHeight);
+            int x = (int)Math.Round(hudAnchorNormalized.X * screenWidth);
+            int y = (int)Math.Round(hudAnchorNormalized.Y * screenHeight);
+            return ClampHudOriginToScreen(new Point(x, y));
+        }
+
+        private static void SetHudOriginPx(Point origin, bool persist)
+        {
+            Point clamped = ClampHudOriginToScreen(origin);
+            int screenWidth = Math.Max(1, GameMain.GraphicsWidth);
+            int screenHeight = Math.Max(1, GameMain.GraphicsHeight);
+            hudAnchorNormalized = new Vector2(
+                Math.Clamp(clamped.X / (float)screenWidth, 0f, 1f),
+                Math.Clamp(clamped.Y / (float)screenHeight, 0f, 1f));
+
+            if (persist)
+            {
+                SaveVolumes();
+            }
+        }
+
+        private static void StartHudMoveMode()
+        {
+            CloseSettingsMenu();
+            isHudDragPendingStart = true;
+            isHudDragging = false;
+            DebugConsole.Log("VoiceChatMonitor: HUD move mode enabled. Hold and drag with left mouse.");
+        }
+
+        private static void UpdateHudDrag()
+        {
+            if (!isHudDragPendingStart && !isHudDragging) { return; }
+
+            if (isHudDragPendingStart)
+            {
+                if (PlayerInput.PrimaryMouseButtonHeld())
+                {
+                    isHudDragPendingStart = false;
+                    isHudDragging = true;
+                    hudDragStartMouse = PlayerInput.MousePosition.ToPoint();
+                    hudDragStartOrigin = GetHudOriginPx();
+                }
+                return;
+            }
+
+            if (!PlayerInput.PrimaryMouseButtonHeld())
+            {
+                isHudDragging = false;
+                SetHudOriginPx(GetHudOriginPx(), persist: true);
+                DebugConsole.Log("VoiceChatMonitor: HUD position saved.");
+                return;
+            }
+
+            Point currentMouse = PlayerInput.MousePosition.ToPoint();
+            Point delta = currentMouse - hudDragStartMouse;
+            Point targetOrigin = hudDragStartOrigin + delta;
+            SetHudOriginPx(targetOrigin, persist: false);
+        }
+
         private static void LoadVolumes()
         {
             try
             {
-                if (File.Exists(settingsPath))
+                savedVolumes.Clear();
+                displayMode = VoiceBarDisplayMode.Current;
+                hudAnchorNormalized = new Vector2(-1f, -1f);
+
+                string pathToLoad = settingsPath;
+                if (!File.Exists(pathToLoad) && File.Exists(legacySettingsPath))
                 {
-                    XDocument doc = XDocument.Load(settingsPath);
-                    savedVolumes.Clear();
+                    pathToLoad = legacySettingsPath;
+                }
+
+                loadedFromLegacyPath = string.Equals(pathToLoad, legacySettingsPath, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(pathToLoad, settingsPath, StringComparison.OrdinalIgnoreCase);
+
+                if (File.Exists(pathToLoad))
+                {
+                    XDocument doc = XDocument.Load(pathToLoad);
+                    XElement? settingsElement = doc.Root?.Element("settings");
+                    displayMode = ParseDisplayMode(settingsElement?.GetAttributeString("displaymode", "current") ?? "current");
+                    float hudX = settingsElement?.GetAttributeFloat("hudx", -1f) ?? -1f;
+                    float hudY = settingsElement?.GetAttributeFloat("hudy", -1f) ?? -1f;
+                    if (IsNormalizedCoordValid(hudX) && IsNormalizedCoordValid(hudY))
+                    {
+                        hudAnchorNormalized = new Vector2(hudX, hudY);
+                    }
                     foreach (var element in doc.Root?.Elements("player") ?? Enumerable.Empty<XElement>())
                     {
                         // Try AccountID first, then SessionId, then name (for backward compatibility)
@@ -110,7 +286,7 @@ namespace Test
                             savedVolumes[key] = volume;
                         }
                     }
-                    DebugConsole.Log($"Loaded {savedVolumes.Count} voice volume settings");
+                    DebugConsole.Log($"Loaded {savedVolumes.Count} voice volume settings from {pathToLoad} (mode: {displayMode})");
                 }
             }
             catch (Exception ex)
@@ -130,6 +306,10 @@ namespace Test
                 }
                 
                 XDocument doc = new XDocument(new XElement("volumes"));
+                doc.Root!.Add(new XElement("settings",
+                    new XAttribute("displaymode", ToDisplayModeValue(displayMode)),
+                    new XAttribute("hudx", hudAnchorNormalized.X),
+                    new XAttribute("hudy", hudAnchorNormalized.Y)));
                 foreach (var kvp in savedVolumes)
                 {
                     var playerElement = new XElement("player",
@@ -156,6 +336,7 @@ namespace Test
                     doc.Root!.Add(playerElement);
                 }
                 doc.Save(settingsPath);
+                loadedFromLegacyPath = false;
                 DebugConsole.Log($"Saved {savedVolumes.Count} voice volume settings to {settingsPath}");
             }
             catch (Exception ex)
@@ -190,6 +371,25 @@ namespace Test
             SaveVolumes();
         }
 
+        public static string GetSettingsPath()
+        {
+            return settingsPath;
+        }
+
+        public static void SetDisplayMode(VoiceBarDisplayMode mode)
+        {
+            if (displayMode == mode) { return; }
+            displayMode = mode;
+            float fadeOutTime = GetCurrentFadeOutTime();
+            foreach (var bar in activeVoiceBars.Values)
+            {
+                bar.FadeTimer = Math.Min(bar.FadeTimer, fadeOutTime);
+            }
+            SaveVolumes();
+            DebugConsole.Log($"VoiceChatMonitor: display mode changed to {displayMode}");
+            RefreshSettingsMenuControls();
+        }
+
         public static bool IsClientSpeaking(Client client)
         {
             if (client?.VoipSound == null) return false;
@@ -209,6 +409,8 @@ namespace Test
             {
                 return;
             }
+
+            UpdateHudDrag();
 
             // Track volume changes for all connected clients
             foreach (var client in GameMain.Client.ConnectedClients)
@@ -258,7 +460,7 @@ namespace Test
                 }
                 else
                 {
-                    bar.FadeTimer = FadeOutTime;
+                    bar.FadeTimer = GetCurrentFadeOutTime();
                     bar.Update(deltaTime, client);
                 }
             }
@@ -291,15 +493,22 @@ namespace Test
             {
                 UpdateClickButtonPosition(kvp.Key);
             }
+
+            UpdateSettingsButtonPosition();
             
             // Update visibility of buttons depending on GUI state
             UpdateButtonVisibility();
             
             // Important: add the container to the update list every frame to ensure button handling
             // This is similar to how it's done for other elements in HandlePersistingElements
-            if (buttonContainer != null && activeVoiceBars.Count > 0)
+            if (buttonContainer != null && (activeVoiceBars.Count > 0 || isHudDragPendingStart || isHudDragging))
             {
                 buttonContainer.AddToGUIUpdateList(order: 1);
+            }
+
+            if (settingsMenuRoot?.Visible == true)
+            {
+                settingsMenuRoot.AddToGUIUpdateList(order: 2);
             }
         }
 
@@ -339,12 +548,12 @@ namespace Test
         private static GUIButton CreateClickButton(Client client)
         {
             // Calculate absolute position
-            float screenWidth = GameMain.GraphicsWidth;
-            float startX = screenWidth - BarWidth - RightMargin;
+            Point hudOrigin = GetHudOriginPx();
+            float startX = hudOrigin.X;
             
             // Find index in list
             int index = activeVoiceBars.Values.ToList().Count;
-            float currentY = TopMargin + index * (BarHeight + TextHeight + BarSpacing);
+            float currentY = hudOrigin.Y + index * (BarHeight + TextHeight + BarSpacing);
             
             // Calculate size of clickable area
             Vector2 textSize = GUIStyle.SmallFont.MeasureString(client.Name ?? "Unknown");
@@ -408,15 +617,15 @@ namespace Test
             if (!clickButtons.TryGetValue(client, out var button)) return;
             
             // Calculate position
-            float screenWidth = GameMain.GraphicsWidth;
-            float startX = screenWidth - BarWidth - RightMargin;
+            Point hudOrigin = GetHudOriginPx();
+            float startX = hudOrigin.X;
             
             // Find index in list
             var barsList = activeVoiceBars.Values.ToList();
             int index = barsList.FindIndex(b => b.Client == client);
             if (index < 0) return;
             
-            float currentY = TopMargin + index * (BarHeight + TextHeight + BarSpacing);
+            float currentY = hudOrigin.Y + index * (BarHeight + TextHeight + BarSpacing);
             float padding = 5f;
             
             // Update the button's (absolute) position from top left corner
@@ -425,6 +634,72 @@ namespace Test
             // Ensure button is visible and enabled
             button.Visible = true;
             button.Enabled = true;
+        }
+
+        private static void EnsureSettingsButton()
+        {
+            if (GUI.Canvas == null || buttonContainer == null || settingsButton != null) { return; }
+
+            settingsButton = new GUIButton(
+                new RectTransform(new Point(SettingsButtonSize, SettingsButtonSize), buttonContainer.RectTransform, Anchor.TopLeft),
+                text: string.Empty,
+                style: null)
+            {
+                CanBeFocused = true,
+                Enabled = true,
+                Visible = true,
+                HoverCursor = CursorState.Hand,
+                ToolTip = "SpeakerList Settings",
+                UpdateOrder = 1,
+                Color = Color.Transparent,
+                HoverColor = new Color(70, 70, 70, 210),
+                PressedColor = new Color(96, 96, 96, 230),
+                OnClicked = (_, _) =>
+                {
+                    OpenSettingsMenu();
+                    return true;
+                }
+            };
+            settingsButton.Frame.Color = Color.Transparent;
+            settingsButton.Frame.HoverColor = Color.Transparent;
+            settingsButton.Frame.PressedColor = Color.Transparent;
+            settingsButton.Frame.CanBeFocused = false;
+
+            new GUIImage(new RectTransform(new Vector2(0.72f), settingsButton.RectTransform, Anchor.Center), style: "GUIButtonInfo")
+            {
+                CanBeFocused = false
+            };
+
+            settingsButton.AddToGUIUpdateList(order: 1);
+        }
+
+        private static void UpdateSettingsButtonPosition()
+        {
+            if (activeVoiceBars.Count == 0)
+            {
+                RemoveSettingsButton();
+                return;
+            }
+
+            EnsureSettingsButton();
+            if (settingsButton == null) { return; }
+
+            // Keep it at the right side, but above the first voice bar to avoid overlap with
+            // the invisible per-bar click area.
+            Point hudOrigin = GetHudOriginPx();
+            int x = (int)(hudOrigin.X + BarWidth + SettingsButtonOffsetX);
+            int y = (int)Math.Max(6, hudOrigin.Y - SettingsButtonSize - 6);
+            settingsButton.RectTransform.AbsoluteOffset = new Point(x, y);
+            settingsButton.Visible = true;
+            settingsButton.Enabled = true;
+        }
+
+        private static void RemoveSettingsButton()
+        {
+            if (settingsButton == null) { return; }
+            GUI.RemoveFromUpdateList(settingsButton, true);
+            settingsButton.RectTransform.Parent = null;
+            settingsButton = null;
         }
 
         private static void RemoveBar(Client client)
@@ -465,6 +740,8 @@ namespace Test
             {
                 buttonContainer.ClearChildren();
             }
+            RemoveSettingsButton();
+            RemoveSettingsMenu();
         }
 
         public static List<VoiceBar> GetActiveBars()
@@ -477,11 +754,11 @@ namespace Test
             if (GUI.DisableHUD) return;
 
             var barsToDraw = activeVoiceBars.Values.ToList();
-            if (barsToDraw.Count == 0) return;
+            if (barsToDraw.Count == 0 && !isHudDragPendingStart && !isHudDragging) return;
 
-            float screenWidth = GameMain.GraphicsWidth;
-            float startX = screenWidth - BarWidth - RightMargin;
-            float currentY = TopMargin;
+            Point hudOrigin = GetHudOriginPx();
+            float startX = hudOrigin.X;
+            float currentY = hudOrigin.Y;
 
             foreach (var bar in barsToDraw)
             {
@@ -491,6 +768,16 @@ namespace Test
                 UpdateClickButtonPosition(bar.Client);
                 
                 currentY += BarHeight + TextHeight + BarSpacing;
+            }
+
+            if (isHudDragPendingStart || isHudDragging)
+            {
+                string hint = isHudDragging
+                    ? "Move SpeakerList HUD and release to save"
+                    : "Hold left mouse and drag SpeakerList HUD";
+                Vector2 hintPos = new Vector2(startX, Math.Max(6f, hudOrigin.Y - 24f));
+                GUIStyle.SmallFont.DrawString(spriteBatch, hint, hintPos + Vector2.One, Color.Black * 0.8f);
+                GUIStyle.SmallFont.DrawString(spriteBatch, hint, hintPos, SettingsTextMain);
             }
         }
 
@@ -502,6 +789,17 @@ namespace Test
             {
                 button.Visible = shouldBeVisible;
                 button.Enabled = shouldBeVisible;
+            }
+
+            bool settingsVisible = shouldBeVisible && activeVoiceBars.Count > 0;
+            if (isHudDragging || isHudDragPendingStart)
+            {
+                settingsVisible = true;
+            }
+            if (settingsButton != null)
+            {
+                settingsButton.Visible = settingsVisible;
+                settingsButton.Enabled = settingsVisible;
             }
         }
 
@@ -609,6 +907,275 @@ namespace Test
                 }
             };
         }
+
+        private static void EnsureSettingsMenuCreated()
+        {
+            if (settingsMenuRoot != null || GUI.Canvas == null) { return; }
+
+            settingsMenuRoot = new GUIFrame(new RectTransform(Vector2.One, GUI.Canvas), style: null)
+            {
+                CanBeFocused = false,
+                Visible = false,
+                Color = Color.Transparent
+            };
+
+            var backgroundBlocker = new GUIButton(new RectTransform(Vector2.One, settingsMenuRoot.RectTransform), style: null)
+            {
+                Color = Color.Transparent,
+                HoverColor = Color.Transparent,
+                PressedColor = Color.Transparent,
+                OnClicked = (_, _) =>
+                {
+                    // Keep the menu open on background click; explicit close buttons only.
+                    return true;
+                }
+            };
+
+            new GUIFrame(new RectTransform(Vector2.One, backgroundBlocker.RectTransform), style: "GUIBackgroundBlocker");
+            int width = Math.Max(GUI.IntScale(480), 440);
+            int height = Math.Max(GUI.IntScale(320), 300);
+            int headerHeight = GUI.IntScale(30);
+
+            var frame = new GUIFrame(new RectTransform(new Point(width, height), backgroundBlocker.RectTransform, Anchor.Center), style: null)
+            {
+                CanBeFocused = true,
+                Color = SettingsWindowBg,
+                OutlineColor = SettingsBorder
+            };
+
+            var header = new GUIFrame(
+                new RectTransform(new Vector2(1f, 0f), frame.RectTransform, Anchor.TopLeft)
+                {
+                    MinSize = new Point(0, headerHeight)
+                }, style: null)
+            {
+                Color = SettingsHeaderBg
+            };
+
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.85f, 1f), header.RectTransform, Anchor.CenterLeft),
+                "SpeakerList Settings",
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.CenterLeft)
+            {
+                TextColor = SettingsTextMain,
+                CanBeFocused = false,
+                Padding = new Vector4(GUI.IntScale(10), 0, 0, 0)
+            };
+
+            var closeBtn = new GUIButton(
+                new RectTransform(new Point(headerHeight, headerHeight), header.RectTransform, Anchor.TopRight),
+                "x", style: null)
+            {
+                Color = Color.Transparent,
+                HoverColor = new Color(70, 70, 70, 220),
+                PressedColor = new Color(96, 96, 96, 230),
+                TextColor = SettingsTextDim,
+                Font = GUIStyle.SmallFont,
+                ToolTip = "Close"
+            };
+            closeBtn.OnClicked = (_, _) =>
+            {
+                CloseSettingsMenu();
+                return true;
+            };
+
+            var displaySection = new GUIFrame(
+                new RectTransform(new Vector2(0.92f, 0.28f), frame.RectTransform, Anchor.TopCenter)
+                {
+                    RelativeOffset = new Vector2(0f, 0.14f)
+                }, style: null)
+            {
+                Color = SettingsSectionBg,
+                OutlineColor = SettingsSectionBorder
+            };
+
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.92f, 0.30f), displaySection.RectTransform, Anchor.TopCenter),
+                "Display",
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.CenterLeft)
+            {
+                TextColor = SettingsTextDim,
+                Padding = new Vector4(GUI.IntScale(8), 0, 0, 0),
+                CanBeFocused = false
+            };
+
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.40f, 0.34f), displaySection.RectTransform, Anchor.CenterLeft),
+                "Display Mode",
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.CenterLeft)
+            {
+                TextColor = SettingsTextMain,
+                Padding = new Vector4(GUI.IntScale(6), 0, 0, 0),
+                CanBeFocused = false
+            };
+
+            settingsDisplayModeDropdown = new GUIDropDown(
+                new RectTransform(new Vector2(0.48f, 0.42f), displaySection.RectTransform, Anchor.CenterRight),
+                elementCount: 2,
+                dropAbove: true)
+            {
+                ToolTip = "Voice bar render mode"
+            };
+            settingsDisplayModeDropdown.AddItem("Current", VoiceBarDisplayMode.Current);
+            settingsDisplayModeDropdown.AddItem("Enhanced", VoiceBarDisplayMode.Enhanced);
+            settingsDisplayModeDropdown.OnSelected = (_, userData) =>
+            {
+                if (userData is VoiceBarDisplayMode mode)
+                {
+                    DebugConsole.Log($"VoiceChatMonitor: dropdown select {displayMode} -> {mode}");
+                    SetDisplayMode(mode);
+                }
+                return true;
+            };
+
+            var moveHudButton = new GUIButton(
+                new RectTransform(new Vector2(0.42f, 0.28f), displaySection.RectTransform, Anchor.BottomRight)
+                {
+                    RelativeOffset = new Vector2(0f, -0.06f)
+                },
+                "Move HUD",
+                style: null)
+            {
+                Color = new Color(42, 42, 42, 255),
+                HoverColor = new Color(68, 68, 68, 255),
+                PressedColor = new Color(88, 88, 88, 255),
+                TextColor = SettingsTextMain,
+                Font = GUIStyle.SmallFont,
+                ToolTip = "Close settings and drag the speaker HUD"
+            };
+            moveHudButton.OnClicked = (_, _) =>
+            {
+                StartHudMoveMode();
+                return true;
+            };
+
+            var pathSection = new GUIFrame(
+                new RectTransform(new Vector2(0.94f, 0.36f), frame.RectTransform, Anchor.TopCenter)
+                {
+                    RelativeOffset = new Vector2(0f, 0.47f)
+                }, style: null)
+            {
+                Color = SettingsSectionBg,
+                OutlineColor = SettingsSectionBorder
+            };
+
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.96f, 0.24f), pathSection.RectTransform, Anchor.TopCenter),
+                "Storage",
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.CenterLeft)
+            {
+                TextColor = SettingsTextDim,
+                Padding = new Vector4(GUI.IntScale(8), 0, 0, 0),
+                CanBeFocused = false
+            };
+
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.96f, 0.22f), pathSection.RectTransform, Anchor.TopCenter)
+                {
+                    RelativeOffset = new Vector2(0f, 0.25f)
+                },
+                "Settings File Path",
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.CenterLeft)
+            {
+                TextColor = SettingsTextMain,
+                Padding = new Vector4(GUI.IntScale(6), 0, 0, 0),
+                CanBeFocused = false
+            };
+
+            settingsPathTextBox = new GUITextBox(
+                new RectTransform(new Vector2(0.96f, 0.28f), pathSection.RectTransform, Anchor.TopCenter)
+                {
+                    RelativeOffset = new Vector2(0f, 0.54f)
+                },
+                settingsPath,
+                font: GUIStyle.SmallFont,
+                createPenIcon: false)
+            {
+                Readonly = true,
+                OverflowClip = true,
+                Wrap = false,
+                ToolTip = settingsPath
+            };
+            settingsPathTextBox.TextBlock.CanBeFocused = false;
+            settingsPathTextBox.TextColor = SettingsTextMain;
+            settingsPathTextBox.ClampText = false;
+            settingsPathTextBox.TextBlock.OverflowClip = true;
+
+            var closeBottomBtn = new GUIButton(
+                new RectTransform(new Vector2(0.38f, 0.11f), frame.RectTransform, Anchor.BottomCenter)
+                {
+                    RelativeOffset = new Vector2(0f, -0.035f)
+                },
+                TextManager.Get("Close"),
+                style: null)
+            {
+                Color = new Color(42, 42, 42, 255),
+                HoverColor = new Color(68, 68, 68, 255),
+                PressedColor = new Color(88, 88, 88, 255),
+                TextColor = SettingsTextMain
+            };
+            closeBottomBtn.OnClicked = (_, _) =>
+            {
+                CloseSettingsMenu();
+                return true;
+            };
+
+            // Keep the display section (and its dropdown list) above the storage section.
+            displaySection.SetAsLastChild();
+
+            RefreshSettingsMenuControls();
+        }
+
+        private static void RefreshSettingsMenuControls()
+        {
+            if (settingsDisplayModeDropdown != null)
+            {
+                int index = displayMode == VoiceBarDisplayMode.Enhanced ? 1 : 0;
+                if (!(settingsDisplayModeDropdown.SelectedData is VoiceBarDisplayMode selectedMode) || selectedMode != displayMode)
+                {
+                    settingsDisplayModeDropdown.Select(index);
+                }
+            }
+        }
+
+        private static void OpenSettingsMenu()
+        {
+            if (GUI.Canvas == null) { return; }
+            EnsureSettingsMenuCreated();
+            if (settingsMenuRoot == null) { return; }
+
+            if (settingsPathTextBox != null)
+            {
+                settingsPathTextBox.Text = settingsPath;
+                settingsPathTextBox.ToolTip = settingsPath;
+            }
+            RefreshSettingsMenuControls();
+
+            settingsMenuRoot.Visible = true;
+            settingsMenuRoot.AddToGUIUpdateList(order: 2);
+            DebugConsole.Log("VoiceChatMonitor: opening SpeakerList settings menu");
+        }
+
+        private static void CloseSettingsMenu()
+        {
+            if (settingsMenuRoot == null) { return; }
+            settingsMenuRoot.Visible = false;
+        }
+
+        private static void RemoveSettingsMenu()
+        {
+            if (settingsMenuRoot == null) { return; }
+            GUI.RemoveFromUpdateList(settingsMenuRoot, true);
+            settingsMenuRoot.RectTransform.Parent = null;
+            settingsMenuRoot = null;
+            settingsPathTextBox = null;
+            settingsDisplayModeDropdown = null;
+        }
     }
 
     // Class for displaying the voice bar (manual drawing)
@@ -616,13 +1183,20 @@ namespace Test
     {
         private readonly Client client;
         private float currentAmplitude = 0f;
+        private Color lastBarBaseColor = Color.White;
+        private static Sprite cachedSpectatorIcon;
+
         public float FadeTimer { get; set; }
         public Client Client => client;
 
         public VoiceBar(Client client)
         {
             this.client = client;
-            FadeTimer = VoiceChatUI.FadeOutTime;
+            FadeTimer = VoiceChatUI.GetCurrentFadeOutTime();
+            if (VoiceChatUI.CurrentDisplayMode == VoiceBarDisplayMode.Enhanced)
+            {
+                lastBarBaseColor = GetCurrentBarBaseColor();
+            }
         }
 
         public void Update(float deltaTime, Client client)
@@ -630,6 +1204,10 @@ namespace Test
             if (client?.VoipSound != null)
             {
                 currentAmplitude = Math.Min(client.VoipSound.CurrentAmplitude * 2.0f, 1.0f);
+                if (VoiceChatUI.CurrentDisplayMode == VoiceBarDisplayMode.Enhanced)
+                {
+                    lastBarBaseColor = GetCurrentBarBaseColor();
+                }
             }
             else
             {
@@ -639,8 +1217,21 @@ namespace Test
 
         public void Draw(SpriteBatch spriteBatch, Vector2 position)
         {
-            // Calculate alpha channel based on FadeTimer
-            float alpha = Math.Min(FadeTimer / VoiceChatUI.FadeOutTime, 1.0f);
+            float fadeOutTime = Math.Max(VoiceChatUI.GetCurrentFadeOutTime(), 0.0001f);
+            float alpha = Math.Min(FadeTimer / fadeOutTime, 1.0f);
+
+            if (VoiceChatUI.CurrentDisplayMode == VoiceBarDisplayMode.Enhanced)
+            {
+                DrawEnhanced(spriteBatch, position, alpha);
+            }
+            else
+            {
+                DrawCurrent(spriteBatch, position, alpha);
+            }
+        }
+
+        private void DrawCurrent(SpriteBatch spriteBatch, Vector2 position, float alpha)
+        {
             var greenColor = GUIStyle.Green.Value;
             Color barColor = new Color(greenColor.R, greenColor.G, greenColor.B, (byte)(alpha * 255));
             Color outlineColor = new Color((byte)(0.5f * 255), (byte)(0.57f * 255), (byte)(0.6f * 255), (byte)(alpha * 255));
@@ -661,6 +1252,137 @@ namespace Test
             Vector2 barPos = new Vector2(position.X, -position.Y);
             GUI.DrawProgressBar(spriteBatch, barPos, new Vector2(VoiceChatUI.BarWidth, VoiceChatUI.BarHeight), 
                 currentAmplitude, barColor, outlineColor);
+        }
+
+        private void DrawEnhanced(SpriteBatch spriteBatch, Vector2 position, float alpha)
+        {
+            Color barColor = GetBarColor(alpha);
+            Color outlineColor = new Color((byte)(0.5f * 255), (byte)(0.57f * 255), (byte)(0.6f * 255), (byte)(alpha * 255));
+            Color textColor = GetNameColor(alpha);
+
+            Sprite jobIcon = GetJobIcon();
+            Sprite spectatorIcon = null;
+            if (jobIcon == null && IsSpectatorOrJobless())
+            {
+                spectatorIcon = GetSpectatorIcon();
+            }
+
+            const float iconSize = 16f;
+            const float iconSpacing = 3f;
+            const float spectatorIconScale = 0.24f;
+            const float textScale = 1.0f;
+
+            string playerName = GetDisplayName();
+            Vector2 textSize = GUIStyle.SmallFont.MeasureString(playerName) * textScale;
+            float iconWidth = (jobIcon != null || IsSpectatorOrJobless()) ? (iconSize + iconSpacing) : 0f;
+            float totalLabelWidth = textSize.X + iconWidth;
+
+            Vector2 labelStartPos = new Vector2(position.X - totalLabelWidth - 5f, position.Y);
+            Vector2 textPos = new Vector2(labelStartPos.X + iconWidth, position.Y);
+
+            float verticalOffset = (VoiceChatUI.BarHeight - iconSize) / 2f + 6f;
+            Vector2 iconPos = new Vector2(labelStartPos.X, position.Y + verticalOffset);
+
+            if (jobIcon != null)
+            {
+                float baseSize = Math.Max(1f, Math.Max(jobIcon.SourceRect.Width, jobIcon.SourceRect.Height));
+                float iconScale = iconSize / baseSize;
+                jobIcon.Draw(spriteBatch, iconPos + new Vector2(1.5f, 1.5f), Color.Black * (alpha * 0.85f), scale: iconScale);
+                jobIcon.Draw(spriteBatch, iconPos, textColor, scale: iconScale);
+            }
+            else if (spectatorIcon != null)
+            {
+                spectatorIcon.Draw(spriteBatch, iconPos + new Vector2(1.5f, 1.5f), Color.Black * (alpha * 0.85f), scale: spectatorIconScale);
+                spectatorIcon.Draw(spriteBatch, iconPos, textColor, scale: spectatorIconScale);
+            }
+            else if (IsSpectatorOrJobless())
+            {
+                const string fallbackIcon = "o";
+                GUI.DrawString(spriteBatch, iconPos + Vector2.One, fallbackIcon, Color.Black * alpha, null, 0, GUIStyle.SmallFont);
+                GUI.DrawString(spriteBatch, iconPos, fallbackIcon, textColor, null, 0, GUIStyle.SmallFont);
+            }
+
+            Vector2 textOrigin = Vector2.Zero;
+            Vector2 textScaleVector = new Vector2(textScale, textScale);
+            GUIStyle.SmallFont.DrawString(spriteBatch, playerName, new Vector2(textPos.X + 1, textPos.Y + 1), Color.Black * alpha, 0f, textOrigin, textScaleVector, SpriteEffects.None, 0f);
+            GUIStyle.SmallFont.DrawString(spriteBatch, playerName, textPos, textColor, 0f, textOrigin, textScaleVector, SpriteEffects.None, 0f);
+
+            Vector2 barPos = new Vector2(position.X, -position.Y);
+            GUI.DrawProgressBar(spriteBatch, barPos, new Vector2(VoiceChatUI.BarWidth, VoiceChatUI.BarHeight),
+                currentAmplitude, barColor, outlineColor);
+        }
+
+        private Color GetNameColor(float alpha)
+        {
+            Color baseColor;
+            var jobPrefab = client?.Character?.Info?.Job?.Prefab;
+            if (jobPrefab != null)
+            {
+                baseColor = jobPrefab.UIColor;
+            }
+            else
+            {
+                baseColor = ChatMessage.MessageColor[(int)ChatMessageType.Dead];
+            }
+            return new Color(baseColor.R, baseColor.G, baseColor.B, (byte)(alpha * 255));
+        }
+
+        private Sprite GetJobIcon()
+        {
+            return client?.Character?.Info?.Job?.Prefab?.IconSmall;
+        }
+
+        private bool IsSpectatorOrJobless()
+        {
+            return client?.Spectating == true || client?.Character?.Info?.Job?.Prefab?.IconSmall == null;
+        }
+
+        private string GetDisplayName()
+        {
+            return client?.Name ?? "Unknown";
+        }
+
+        private Sprite GetSpectatorIcon()
+        {
+            if (cachedSpectatorIcon != null) { return cachedSpectatorIcon; }
+            try
+            {
+                cachedSpectatorIcon =
+                    GUIStyle.GetComponentStyle("SpectateIcon")?.GetDefaultSprite() ??
+                    GUIStyle.GetComponentStyle("spectateicon")?.GetDefaultSprite();
+                return cachedSpectatorIcon;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private Color GetCurrentBarBaseColor()
+        {
+            bool isSpectatorOrDead =
+                client?.Spectating == true ||
+                client?.Character == null ||
+                client.Character.IsDead ||
+                client.Character.Removed ||
+                client?.Character?.Info?.Job?.Prefab == null;
+
+            if (isSpectatorOrDead)
+            {
+                return ChatMessage.MessageColor[(int)ChatMessageType.Dead];
+            }
+
+            if (client?.VoipSound != null && client.VoipSound.UsingRadio)
+            {
+                return ChatMessage.MessageColor[(int)ChatMessageType.Radio];
+            }
+
+            return ChatMessage.MessageColor[(int)ChatMessageType.Default];
+        }
+
+        private Color GetBarColor(float alpha)
+        {
+            return new Color(lastBarBaseColor.R, lastBarBaseColor.G, lastBarBaseColor.B, (byte)(alpha * 255));
         }
     }
 
