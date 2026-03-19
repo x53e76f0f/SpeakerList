@@ -52,7 +52,11 @@ namespace Test
         private static GUIButton settingsButton;
         private static GUIFrame settingsMenuRoot;
         private static GUITextBox settingsPathTextBox;
-        private static GUIDropDown settingsDisplayModeDropdown;
+        private static GUIButton settingsDisplayModeButton;
+        private static GUIFrame settingsDisplayModeList;
+        private static GUIButton settingsDisplayModeCurrentButton;
+        private static GUIButton settingsDisplayModeEnhancedButton;
+        private static bool isSettingsDisplayModeListOpen;
         private static readonly Dictionary<string, float> savedVolumes = new Dictionary<string, float>(); // Key: AccountID or SessionId as string
         private static readonly Dictionary<Client, float> lastKnownVolumes = new Dictionary<Client, float>(); // Track volume changes
         private static VoiceBarDisplayMode displayMode = VoiceBarDisplayMode.Current;
@@ -67,7 +71,7 @@ namespace Test
         private const float VoiceThreshold = 0.01f; // Minimum amplitude for displaying
         private const float CurrentFadeOutTime = 0.9f; // Fade out time for the old mode
         private const float EnhancedFadeOutTime = 2.1f; // Fade out time for the enhanced mode
-        
+
         // Drawing parameters (same as for the boss bars on the right)
         public const float BarWidth = 150f;   // Bar width
         public const float BarHeight = 20f;   // Bar height
@@ -76,7 +80,7 @@ namespace Test
         public const float RightMargin = 10f; // Margin from the right
         public const float TopMargin = 100f;  // Margin from the top (to not overlap other UI elements)
         private const int SettingsButtonSize = 16;
-        private const int SettingsButtonOffsetX = -3; // Tune this to move the side settings icon horizontally.
+        private const int SettingsButtonOffsetX = -6; // Tune this to move the side settings icon horizontally.
         private static readonly Color SettingsWindowBg = new Color(15, 15, 15, 242);
         private static readonly Color SettingsHeaderBg = new Color(7, 7, 7, 255);
         private static readonly Color SettingsBorder = new Color(88, 88, 88, 255);
@@ -84,6 +88,8 @@ namespace Test
         private static readonly Color SettingsSectionBorder = new Color(62, 62, 62, 255);
         private static readonly Color SettingsTextMain = new Color(224, 224, 224, 255);
         private static readonly Color SettingsTextDim = new Color(148, 148, 148, 255);
+        private static readonly Color SettingsControlBg = new Color(14, 14, 14, 255);
+        private static readonly Color SettingsControlHover = new Color(26, 26, 26, 255);
 
         public static VoiceBarDisplayMode CurrentDisplayMode => displayMode;
 
@@ -508,6 +514,11 @@ namespace Test
 
             if (settingsMenuRoot?.Visible == true)
             {
+                if (isSettingsDisplayModeListOpen)
+                {
+                    RepositionDisplayModeList();
+                }
+                UpdateSettingsPathDisplayText();
                 settingsMenuRoot.AddToGUIUpdateList(order: 2);
             }
         }
@@ -926,6 +937,10 @@ namespace Test
                 PressedColor = Color.Transparent,
                 OnClicked = (_, _) =>
                 {
+                    if (isSettingsDisplayModeListOpen)
+                    {
+                        SetDisplayModeListVisible(false);
+                    }
                     // Keep the menu open on background click; explicit close buttons only.
                     return true;
                 }
@@ -1012,22 +1027,86 @@ namespace Test
                 CanBeFocused = false
             };
 
-            settingsDisplayModeDropdown = new GUIDropDown(
+            settingsDisplayModeButton = new GUIButton(
                 new RectTransform(new Vector2(0.48f, 0.42f), displaySection.RectTransform, Anchor.CenterRight),
-                elementCount: 2,
-                dropAbove: true)
+                string.Empty,
+                style: null)
             {
+                Color = SettingsControlBg,
+                HoverColor = SettingsControlHover,
+                PressedColor = SettingsControlHover,
+                TextColor = SettingsTextMain,
                 ToolTip = "Voice bar render mode"
             };
-            settingsDisplayModeDropdown.AddItem("Current", VoiceBarDisplayMode.Current);
-            settingsDisplayModeDropdown.AddItem("Enhanced", VoiceBarDisplayMode.Enhanced);
-            settingsDisplayModeDropdown.OnSelected = (_, userData) =>
+            settingsDisplayModeButton.OnClicked = (_, _) =>
             {
-                if (userData is VoiceBarDisplayMode mode)
-                {
-                    DebugConsole.Log($"VoiceChatMonitor: dropdown select {displayMode} -> {mode}");
-                    SetDisplayMode(mode);
-                }
+                SetDisplayModeListVisible(!isSettingsDisplayModeListOpen);
+                return true;
+            };
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.90f, 1f), settingsDisplayModeButton.RectTransform, Anchor.CenterLeft),
+                string.Empty,
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.CenterLeft)
+            {
+                TextColor = SettingsTextMain,
+                Padding = new Vector4(GUI.IntScale(6), 0, 0, 0),
+                CanBeFocused = false
+            };
+            new GUITextBlock(
+                new RectTransform(new Vector2(0.10f, 1f), settingsDisplayModeButton.RectTransform, Anchor.CenterRight),
+                "v",
+                font: GUIStyle.SmallFont,
+                textAlignment: Alignment.Center)
+            {
+                TextColor = SettingsTextDim,
+                CanBeFocused = false
+            };
+
+            settingsDisplayModeList = new GUIFrame(
+                new RectTransform(new Point(Math.Max(180, GUI.IntScale(220)), Math.Max(56, GUI.IntScale(58))), settingsMenuRoot.RectTransform, Anchor.TopLeft),
+                style: null)
+            {
+                Visible = false,
+                Color = SettingsSectionBg,
+                OutlineColor = SettingsBorder
+            };
+
+            settingsDisplayModeCurrentButton = new GUIButton(
+                new RectTransform(new Vector2(1f, 0.5f), settingsDisplayModeList.RectTransform, Anchor.TopCenter),
+                "Current",
+                style: null)
+            {
+                Color = SettingsControlBg,
+                HoverColor = SettingsControlHover,
+                PressedColor = SettingsControlHover,
+                TextColor = SettingsTextMain,
+                Font = GUIStyle.SmallFont
+            };
+            settingsDisplayModeCurrentButton.OnClicked = (_, _) =>
+            {
+                DebugConsole.Log($"VoiceChatMonitor: dropdown select {displayMode} -> {VoiceBarDisplayMode.Current}");
+                SetDisplayMode(VoiceBarDisplayMode.Current);
+                SetDisplayModeListVisible(false);
+                return true;
+            };
+
+            settingsDisplayModeEnhancedButton = new GUIButton(
+                new RectTransform(new Vector2(1f, 0.5f), settingsDisplayModeList.RectTransform, Anchor.BottomCenter),
+                "Enhanced",
+                style: null)
+            {
+                Color = SettingsControlBg,
+                HoverColor = SettingsControlHover,
+                PressedColor = SettingsControlHover,
+                TextColor = SettingsTextMain,
+                Font = GUIStyle.SmallFont
+            };
+            settingsDisplayModeEnhancedButton.OnClicked = (_, _) =>
+            {
+                DebugConsole.Log($"VoiceChatMonitor: dropdown select {displayMode} -> {VoiceBarDisplayMode.Enhanced}");
+                SetDisplayMode(VoiceBarDisplayMode.Enhanced);
+                SetDisplayModeListVisible(false);
                 return true;
             };
 
@@ -1103,7 +1182,7 @@ namespace Test
             };
             settingsPathTextBox.TextBlock.CanBeFocused = false;
             settingsPathTextBox.TextColor = SettingsTextMain;
-            settingsPathTextBox.ClampText = false;
+            settingsPathTextBox.ClampText = true;
             settingsPathTextBox.TextBlock.OverflowClip = true;
 
             var closeBottomBtn = new GUIButton(
@@ -1125,22 +1204,109 @@ namespace Test
                 return true;
             };
 
-            // Keep the display section (and its dropdown list) above the storage section.
+            // Keep the display section above the storage section.
             displaySection.SetAsLastChild();
 
             RefreshSettingsMenuControls();
         }
 
-        private static void RefreshSettingsMenuControls()
+        private static string GetDisplayModeLabel(VoiceBarDisplayMode mode)
         {
-            if (settingsDisplayModeDropdown != null)
+            return mode == VoiceBarDisplayMode.Enhanced ? "Enhanced" : "Current";
+        }
+
+        private static void RepositionDisplayModeList()
+        {
+            if (settingsDisplayModeList == null || settingsDisplayModeButton == null) { return; }
+            Rectangle buttonRect = settingsDisplayModeButton.Rect;
+            int itemHeight = Math.Max(GUI.IntScale(28), 24);
+            int listHeight = itemHeight * 2;
+            int listWidth = Math.Max(buttonRect.Width, Math.Max(180, GUI.IntScale(220)));
+            int x = buttonRect.X;
+            int y = buttonRect.Bottom + 2;
+
+            int maxX = Math.Max(0, GameMain.GraphicsWidth - listWidth - 4);
+            int maxY = Math.Max(0, GameMain.GraphicsHeight - listHeight - 4);
+            x = Math.Clamp(x, 0, maxX);
+            y = Math.Clamp(y, 0, maxY);
+
+            settingsDisplayModeList.RectTransform.AbsoluteOffset = new Point(x, y);
+            settingsDisplayModeList.RectTransform.Resize(new Point(listWidth, listHeight));
+            settingsDisplayModeCurrentButton?.RectTransform.Resize(new Point(listWidth, itemHeight));
+            settingsDisplayModeEnhancedButton?.RectTransform.Resize(new Point(listWidth, itemHeight));
+        }
+
+        private static void SetDisplayModeListVisible(bool visible)
+        {
+            isSettingsDisplayModeListOpen = visible;
+            if (settingsDisplayModeList == null) { return; }
+            if (visible)
             {
-                int index = displayMode == VoiceBarDisplayMode.Enhanced ? 1 : 0;
-                if (!(settingsDisplayModeDropdown.SelectedData is VoiceBarDisplayMode selectedMode) || selectedMode != displayMode)
+                RepositionDisplayModeList();
+                settingsDisplayModeList.Visible = true;
+                settingsDisplayModeList.SetAsLastChild();
+            }
+            else
+            {
+                settingsDisplayModeList.Visible = false;
+            }
+        }
+
+        private static string BuildCenteredEllipsizedText(string text, float maxWidth, GUIFont font)
+        {
+            if (string.IsNullOrEmpty(text)) { return string.Empty; }
+            if (font.MeasureString(text).X <= maxWidth) { return text; }
+
+            const string ellipsis = "...";
+            if (font.MeasureString(ellipsis).X >= maxWidth) { return ellipsis; }
+
+            int leftCount = text.Length / 2;
+            int rightCount = text.Length - leftCount;
+
+            while (leftCount > 0 && rightCount > 0)
+            {
+                string candidate = text.Substring(0, leftCount) + ellipsis + text.Substring(text.Length - rightCount, rightCount);
+                if (font.MeasureString(candidate).X <= maxWidth) { return candidate; }
+
+                if (leftCount >= rightCount)
                 {
-                    settingsDisplayModeDropdown.Select(index);
+                    leftCount--;
+                }
+                else
+                {
+                    rightCount--;
                 }
             }
+
+            return ellipsis;
+        }
+
+        private static void UpdateSettingsPathDisplayText()
+        {
+            if (settingsPathTextBox == null) { return; }
+            float maxTextWidth = Math.Max(18f, settingsPathTextBox.Rect.Width - GUI.IntScale(12));
+            string displayText = BuildCenteredEllipsizedText(settingsPath, maxTextWidth, GUIStyle.SmallFont);
+            settingsPathTextBox.Text = displayText;
+            settingsPathTextBox.ToolTip = settingsPath;
+        }
+
+        private static void RefreshSettingsMenuControls()
+        {
+            if (settingsDisplayModeButton != null)
+            {
+                settingsDisplayModeButton.Text = GetDisplayModeLabel(displayMode);
+            }
+            if (settingsDisplayModeCurrentButton != null)
+            {
+                bool selectedCurrent = displayMode == VoiceBarDisplayMode.Current;
+                settingsDisplayModeCurrentButton.Color = selectedCurrent ? new Color(40, 58, 54, 255) : SettingsControlBg;
+            }
+            if (settingsDisplayModeEnhancedButton != null)
+            {
+                bool selectedEnhanced = displayMode == VoiceBarDisplayMode.Enhanced;
+                settingsDisplayModeEnhancedButton.Color = selectedEnhanced ? new Color(40, 58, 54, 255) : SettingsControlBg;
+            }
+            UpdateSettingsPathDisplayText();
         }
 
         private static void OpenSettingsMenu()
@@ -1151,10 +1317,10 @@ namespace Test
 
             if (settingsPathTextBox != null)
             {
-                settingsPathTextBox.Text = settingsPath;
-                settingsPathTextBox.ToolTip = settingsPath;
+                UpdateSettingsPathDisplayText();
             }
             RefreshSettingsMenuControls();
+            SetDisplayModeListVisible(false);
 
             settingsMenuRoot.Visible = true;
             settingsMenuRoot.AddToGUIUpdateList(order: 2);
@@ -1164,6 +1330,7 @@ namespace Test
         private static void CloseSettingsMenu()
         {
             if (settingsMenuRoot == null) { return; }
+            SetDisplayModeListVisible(false);
             settingsMenuRoot.Visible = false;
         }
 
@@ -1174,7 +1341,11 @@ namespace Test
             settingsMenuRoot.RectTransform.Parent = null;
             settingsMenuRoot = null;
             settingsPathTextBox = null;
-            settingsDisplayModeDropdown = null;
+            settingsDisplayModeButton = null;
+            settingsDisplayModeList = null;
+            settingsDisplayModeCurrentButton = null;
+            settingsDisplayModeEnhancedButton = null;
+            isSettingsDisplayModeListOpen = false;
         }
     }
 
@@ -1286,7 +1457,7 @@ namespace Test
             if (jobIcon != null)
             {
                 float baseSize = Math.Max(1f, Math.Max(jobIcon.SourceRect.Width, jobIcon.SourceRect.Height));
-                float iconScale = iconSize / baseSize;
+                float iconScale = Math.Min(1f, iconSize / baseSize);
                 jobIcon.Draw(spriteBatch, iconPos + new Vector2(1.5f, 1.5f), Color.Black * (alpha * 0.85f), scale: iconScale);
                 jobIcon.Draw(spriteBatch, iconPos, textColor, scale: iconScale);
             }
